@@ -64,7 +64,9 @@ import android.os.PowerManager;
 import android.os.SystemClock;
 import android.os.PowerManager.WakeLock;
 import android.provider.MediaStore;
+import android.support.v4.media.session.MediaSessionCompat;
 import android.util.Log;
+import android.view.KeyEvent;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.RemoteViews;
@@ -281,6 +283,13 @@ public class MediaPlaybackService extends Service {
     private static final int IDLE_DELAY = 60000;
 
     private RemoteControlClient mRemoteControlClient;
+
+    //hoffc fix media button delay receied issue
+    private MediaSessionCompat mSessionCompat;
+    private static final int MSG_LONG_PRESS_TIMEOUT = 1;
+    private static final int LONG_PRESS_DELAY = 1000;
+    private boolean mLaunched = false;
+
 
     private class TrackInfo {
         public long mId;
@@ -568,16 +577,14 @@ public class MediaPlaybackService extends Service {
         stopForeground(true);
 
         mAudioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-        ComponentName rec = new ComponentName(getPackageName(),
+        ComponentName componentName = new ComponentName(getPackageName(),
                 MediaButtonIntentReceiver.class.getName());
-        mAudioManager.registerMediaButtonEventReceiver(rec);
 
         Intent i = new Intent(Intent.ACTION_MEDIA_BUTTON);
-        i.setComponent(rec);
+        i.setComponent(componentName);
         PendingIntent pi = PendingIntent.getBroadcast(this /*context*/,
                 0 /*requestCode, ignored*/, i /*intent*/, 0 /*flags*/);
         mRemoteControlClient = new RemoteControlClient(pi);
-        mAudioManager.registerRemoteControlClient(mRemoteControlClient);
 
         int flags = RemoteControlClient.FLAG_KEY_MEDIA_PREVIOUS
                 | RemoteControlClient.FLAG_KEY_MEDIA_NEXT
@@ -588,6 +595,14 @@ public class MediaPlaybackService extends Service {
                 | RemoteControlClient.FLAG_KEY_MEDIA_STOP;
         mRemoteControlClient.setTransportControlFlags(flags);
         mRemoteControlClient.setPlaybackPositionUpdateListener(mPosListener);
+
+        //hoffc fix media button delay receied issue
+        mSessionCompat = new MediaSessionCompat(this, "MediaPlaybackService",
+                componentName, null);
+        mSessionCompat.setFlags(MediaSessionCompat.FLAG_HANDLES_MEDIA_BUTTONS
+                | MediaSessionCompat.FLAG_HANDLES_TRANSPORT_CONTROLS);
+        mSessionCompat.setCallback(new MediaSessionCallback());
+        mSessionCompat.setActive(true);
 
         mPreferences = getSharedPreferences("Music", MODE_WORLD_READABLE | MODE_WORLD_WRITEABLE);
         mRepeatMode = mPreferences.getInt("repeatmode", REPEAT_NONE);
@@ -670,7 +685,12 @@ public class MediaPlaybackService extends Service {
         mPlayer = null;
 
         mAudioManager.abandonAudioFocus(mAudioFocusListener);
-        mAudioManager.unregisterRemoteControlClient(mRemoteControlClient);
+
+        if (mSessionCompat != null) {
+            mSessionCompat.release();
+            mSessionCompat = null;
+            mMediaButtonHandler.removeCallbacksAndMessages(null);
+        }
 
         // make sure there aren't any other messages coming
         mDelayedStopHandler.removeCallbacksAndMessages(null);
@@ -1659,12 +1679,9 @@ public class MediaPlaybackService extends Service {
     public void play() {
         if (mAudioManager == null) {
             mAudioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
-            mAudioManager.registerRemoteControlClient(mRemoteControlClient);
         }
         mAudioManager.requestAudioFocus(mAudioFocusListener, AudioManager.STREAM_MUSIC,
                 AudioManager.AUDIOFOCUS_GAIN);
-        mAudioManager.registerMediaButtonEventReceiver(new ComponentName(this.getPackageName(),
-                MediaButtonIntentReceiver.class.getName()));
 
         if (mPlayer.isInitialized()) {
             // if we are at the end of the song, playing it again.
@@ -3299,5 +3316,125 @@ public class MediaPlaybackService extends Service {
                     RemoteControlClient.PLAYSTATE_PAUSED;
         }
         mRemoteControlClient.setPlaybackState(state, pos, PLAYBACK_SPEED_1X);
+    }
+
+    private Handler mMediaButtonHandler = new Handler() {
+        @Override
+        public void handleMessage(Message msg) {
+            switch (msg.what) {
+                case MSG_LONG_PRESS_TIMEOUT:
+                    if (!mLaunched) {
+                        Context context = (Context)msg.obj;
+                        Intent i = new Intent();
+                        i.putExtra("autoshuffle", "true");
+                        i.setClass(context, MusicBrowserActivity.class);
+                        i.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                        context.startActivity(i);
+                        mLaunched = true;
+                    }
+                    break;
+            }
+        }
+    };
+
+    private class MediaSessionCallback extends MediaSessionCompat.Callback {
+        private long mLastClickTime = 0;
+        private boolean mDown = false;
+        private PowerManager.WakeLock mWakeLock = null;
+
+        @Override
+        public boolean onMediaButtonEvent(Intent mediaButtonEvent) {
+
+            Context context = MediaPlaybackService.this;
+            if (mWakeLock == null) {
+                PowerManager pm = (PowerManager) context.getSystemService(
+                        Context.POWER_SERVICE);
+                mWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,
+                        this.getClass().getName());
+                mWakeLock.setReferenceCounted(false);
+            }
+
+            // hold wakelock for 3s as to ensure button press event full processed.
+            mWakeLock.acquire(3000);
+
+            KeyEvent event = (KeyEvent)
+                    mediaButtonEvent.getParcelableExtra(Intent.EXTRA_KEY_EVENT);
+            if (event == null) {
+                return super.onMediaButtonEvent(mediaButtonEvent);
+            }
+
+            int keycode = event.getKeyCode();
+            int action = event.getAction();
+            long eventTime = event.getEventTime();
+
+            // single quick press: pause/resume.
+            // double press: next track
+            // long press: start auto-shuffle mode.
+            String command = null;
+            switch (keycode) {
+                case KeyEvent.KEYCODE_MEDIA_STOP:
+                    command = MediaPlaybackService.CMDSTOP;
+                    break;
+                case KeyEvent.KEYCODE_HEADSETHOOK:
+                case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
+                    command = MediaPlaybackService.CMDTOGGLEPAUSE;
+                    break;
+                case KeyEvent.KEYCODE_MEDIA_NEXT:
+                    command = MediaPlaybackService.CMDNEXT;
+                    break;
+                case KeyEvent.KEYCODE_MEDIA_PREVIOUS:
+                    command = MediaPlaybackService.CMDPREVIOUS;
+                    break;
+                case KeyEvent.KEYCODE_MEDIA_PAUSE:
+                    command = MediaPlaybackService.CMDPAUSE;
+                    break;
+                case KeyEvent.KEYCODE_MEDIA_PLAY:
+                    command = MediaPlaybackService.CMDPLAY;
+                    break;
+            }
+
+            if (command != null) {
+                if (action == KeyEvent.ACTION_DOWN) {
+                    if (mDown) {
+                        if ((MediaPlaybackService.CMDTOGGLEPAUSE.equals(command) ||
+                                MediaPlaybackService.CMDPLAY.equals(command))
+                                && mLastClickTime != 0
+                                && eventTime - mLastClickTime > LONG_PRESS_DELAY) {
+                            mMediaButtonHandler.sendMessage(
+                                    mMediaButtonHandler.obtainMessage(MSG_LONG_PRESS_TIMEOUT,
+                                            context));
+                        }
+                    } else if (event.getRepeatCount() == 0) {
+                        // only consider the first event in a sequence, not the repeat events,
+                        // so that we don't trigger in cases where the first event went to
+                        // a different app (e.g. when the user ends a phone call by
+                        // long pressing the headset button)
+
+                        // The service may or may not be running, but we need to send it
+                        // a command.
+                        Intent i = new Intent(context, MediaPlaybackService.class);
+                        i.setAction(MediaPlaybackService.SERVICECMD);
+                        if (keycode == KeyEvent.KEYCODE_HEADSETHOOK &&
+                                eventTime - mLastClickTime < 300) {
+                            i.putExtra(MediaPlaybackService.CMDNAME, MediaPlaybackService.CMDNEXT);
+                            context.startService(i);
+                            mLastClickTime = 0;
+                        } else {
+                            i.putExtra(MediaPlaybackService.CMDNAME, command);
+                            context.startService(i);
+                            mLastClickTime = eventTime;
+                        }
+
+                        mLaunched = false;
+                        mDown = true;
+                    }
+                } else {
+                    mMediaButtonHandler.removeMessages(MSG_LONG_PRESS_TIMEOUT);
+                    mDown = false;
+                }
+            }
+
+            return super.onMediaButtonEvent(mediaButtonEvent);
+        }
     }
 }
