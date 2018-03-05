@@ -604,7 +604,7 @@ public class MediaPlaybackService extends Service {
         mSessionCompat.setCallback(new MediaSessionCallback());
         mSessionCompat.setActive(true);
 
-        mPreferences = getSharedPreferences("Music", MODE_WORLD_READABLE | MODE_WORLD_WRITEABLE);
+        mPreferences = getSharedPreferences("Music", MODE_PRIVATE);
         mRepeatMode = mPreferences.getInt("repeatmode", REPEAT_NONE);
 
         mCardId = MusicUtils.getCardId(this);
